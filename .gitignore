@@ -1,3 +1,5 @@
 # Ignore data files
 *.csv
 *.parquet
+# macOS Finder files
+.DS_Store
