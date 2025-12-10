@@ -7,7 +7,7 @@
 
 ---
 
-## 🎯 Project Goal
+## Project Goal
 
 The primary objective of this project is to answer a specific research question:
 **"Can we predict the future spread of a wildfire solely based on its current shape and the forecasted weather?"**
@@ -16,7 +16,7 @@ We are testing the hypothesis that local weather conditions (Wind, Temperature, 
 
 ---
 
-## 📍 Current Status: Data Collection
+## Current Status: Data Collection
 
 We are currently in the **Data Assembly Phase**. Before we can train any models, we need to align two massive, disparate datasets:
 1.  **Fire Data:** Historical fire perimeters (VIIRS/MODIS).
