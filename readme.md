@@ -41,7 +41,7 @@ The current script (`00_download_fire_weather.py`) performs the initial data gat
 
 If you are collaborating on the data collection phase:
 
-1.  Ensure you have the fire event dataframe (See [Orland et al., 2025](https://zenodo.org/records/15261836)).
+1.  Ensure you have the fire event dataframe (See [Orland et al., 2025](https://zenodo.org/records/15261836)). Hosting on this repo will be considered at a latter date.
 2.  Run the downloader:
     ```bash
     python 01_download_fire_weather.py
@@ -50,11 +50,12 @@ If you are collaborating on the data collection phase:
 
 ---
 
-## 🔜 Next Steps
+##  Next Steps
 
 1.  **Finish Data Ingestion:** Complete the download of weather data for the target fires.
-2.  **Data Pairing:** Create training samples that link a specific fire shape at Time A to the weather forecast for Time B.
-3.  **Model Training:** Train a baseline ML model (likely a CNN or ConvLSTM) to see if it can learn the pattern.
+2.  **Consider adding DEM Data** Need to ingest DEM or slope data for terrain awareness.
+3.  **Data Pairing:** Create training samples that link a specific fire shape at Time A to the weather forecast for Time B.
+4.  **Model Training:** Train a baseline ML model (likely a CNN or ConvLSTM) to see if it can learn the pattern.
 
 ---
 
