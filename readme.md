@@ -23,7 +23,7 @@ We are currently in the **Data Assembly Phase**. Before we can train any models,
 2.  **Weather Data:** Historical weather forecasts (NOAA HRRR).
 
 ### What the code does right now
-The current script (`01_download_fire_weather.py`) performs the initial data gathering.
+The current script (`00_download_fire_weather.py`) performs the initial data gathering.
 * It takes a list of historical fires.
 * It downloads the full history of weather forecasts for that specific area.
 
@@ -34,7 +34,7 @@ The current script (`01_download_fire_weather.py`) performs the initial data gat
 
 * `01_download_fire_weather.py`: The main script currently in use. It connects to the NOAA weather archive and saves the relevant weather data for our target fires.
 * `data/`: Stores the raw inputs and the resulting NetCDF weather files.
-
+* `notebooks/`: Juypter notebooks exploring basic data structure and explaining thought behind modeling approach
 ---
 
 ##  How to Run
