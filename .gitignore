@@ -3,3 +3,6 @@
 *.parquet
 # macOS Finder files
 .DS_Store
+
+# venv
+venv/
