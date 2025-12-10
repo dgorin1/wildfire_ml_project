@@ -36,12 +36,12 @@ import certifi  # For SSL certificate bundle
 os.environ["SSL_CERT_FILE"] = certifi.where()
 
 # --- CONFIGURATION ---
-INPUT_PICKLE_PATH = "path/to/your/fire_dataframe.pkl"   # Placeholder path if loading from disk
+INPUT_DATA = "data/feds_western_us_2019_af_postprocessed.parquet"
 OUTPUT_DIR = "data/raw_weather_nc"                      # Folder where NetCDFs will be saved
 START_DATE = "2018-07-15"                               # Only process fires after this date
 HRRR_URL = "https://data.dynamical.org/noaa/hrrr/forecast-48-hour/latest.zarr?email=optional@email.com"
 N_JOBS = 8                                               # Number of parallel workers
-BUFFER_METERS = 2000                                     # Spatial buffer around fire geometry
+BUFFER_METERS = 0                                    # Spatial buffer around fire geometry
 
 
 # --- HELPER FUNCTIONS ---
@@ -121,8 +121,6 @@ def process_fire_worker(row, weather_ds, output_folder, input_crs):
             return "SKIPPED_NO_TIME_MATCH"
 
         # --- 4. DOWNLOAD & SAVE ---
-        # Keep only needed weather variables
-        subset = subset[['temperature_2m', 'wind_u_10m', 'wind_v_10m']]
 
         # Trigger actual download from remote Zarr store
         subset.load()
@@ -148,8 +146,8 @@ def main():
 
     # 2. Load fire snapshot data from the Parquet file
     print("Aggregating snapshots into unique Fire Events...")
-    data_path = Path(".") / "data" / "feds_western_us_2019_af_postprocessed.parquet"
-    df = gpd.read_parquet(data_path)
+
+    df = gpd.read_parquet(INPUT_DATA)
     df_flat = df.reset_index()
     print(f"Loaded Fire Data. Rows: {len(df_flat)}")
 
