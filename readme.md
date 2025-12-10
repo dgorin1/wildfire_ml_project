@@ -41,7 +41,7 @@ The current script (`00_download_fire_weather.py`) performs the initial data gat
 
 If you are collaborating on the data collection phase:
 
-1.  Ensure you have the fire event dataframe (pickle file).
+1.  Ensure you have the fire event dataframe (See [Orland et al., 2025](https://zenodo.org/records/15261836)).
 2.  Run the downloader:
     ```bash
     python 01_download_fire_weather.py
