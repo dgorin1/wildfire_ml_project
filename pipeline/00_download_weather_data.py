@@ -1,7 +1,3 @@
-"""
-Pipeline Step 1: Weather Download (Production / Full Run)
-"""
-
 import os
 import time
 import pandas as pd
@@ -19,25 +15,25 @@ warnings.filterwarnings("ignore", message=".*Consolidated metadata.*")
 warnings.filterwarnings('ignore')
 
 # --- CONFIGURATION ---
-INPUT_DATA = "data/feds_western_us_2019_af_postprocessed.parquet"
-OUTPUT_DIR = "data/raw_weather_zarr"
+YEARS = [2018, 2019, 2020, 2021]  # List of years to process
+INPUT_DIR = "data"  # Base directory for input files
+BASE_OUTPUT_DIR = "data/raw_weather_zarr"  # Base output directory
 START_DATE = "2018-07-15"
-
 
 HRRR_URL = "https://data.dynamical.org/noaa/hrrr/forecast-48-hour/latest.zarr"
 
-N_JOBS = 12          # 12 
+N_JOBS = 8          # 12 
 BUFFER_METERS = 2200 # 2.2km buffer guarantees capturing grid points
 
 # !!! FULL RUN SETTING !!!
-TEST_LIMIT = 100    # Set to None to process ALL files.
+TEST_LIMIT = None    # Set to None to process ALL files.
 
 # --- HELPER FUNCTIONS ---
 
 def combine_geoms(series):
     return unary_union(series)
 
-def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs):
+def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs, year):
     
     # RETRY CONFIGURATION
     MAX_RETRIES = 30
@@ -101,8 +97,11 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs)
             subset = subset[available_vars]
             
             # 5. Save
-            file_name = f"fireID_{fire_id}_weather.zarr"
-            save_path = os.path.join(output_folder, file_name)
+            year_output_folder = os.path.join(output_folder, str(year))  # Create a subfolder for each year
+            os.makedirs(year_output_folder, exist_ok=True)  # Ensure the folder exists
+
+            file_name = f"fireID_{fire_id}_weather_{year}.zarr"
+            save_path = os.path.join(year_output_folder, file_name)
             
             subset.to_zarr(save_path, mode='w', consolidated=False)
 
@@ -120,60 +119,61 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs)
 
 def main():
     print("--- PIPELINE STEP 1: WEATHER DOWNLOAD (FULL RUN) ---")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # 1. Load Fire Data
+    
+    # 1. Load Fire Data for all years
     print("Loading and aggregating Fire Events...")
-    df = gpd.read_parquet(INPUT_DATA) 
-    df_flat = df.reset_index()
-    
-    # Aggregate logic
-    fire_events = df_flat.groupby('fireID').agg({
-        't': ['min', 'max'],
-        'hull': combine_geoms
-    }).reset_index()
-
-    fire_events.columns = ['fireID', 't_start', 't_end', 'geometry']
-    valid_fires = fire_events[fire_events['t_start'] >= pd.to_datetime(START_DATE)].copy()
-    
-    # --- APPLY TEST LIMIT (IF ANY) ---
-    if TEST_LIMIT:
-        print(f"\n!!! TEST MODE ENABLED: Processing only first {TEST_LIMIT} fires !!!\n")
-        valid_fires = valid_fires.head(TEST_LIMIT)
-    
-    print(f"Unique fires to process: {len(valid_fires)}")
-
-    # 2. Get Weather CRS (One-time check)
-    print("Getting Weather CRS...", end=" ")
-    try:
-        with xr.open_zarr(HRRR_URL, decode_coords="all", storage_options={'ssl': False}) as ds:
-            weather_crs = ds.rio.crs
-        print("Done.")
-
+    for year in YEARS:
+        print(f"Processing year {year}...")
+        input_data = os.path.join(INPUT_DIR, f"feds_western_us_{year}_af_postprocessed.parquet")
+        df = gpd.read_parquet(input_data) 
+        df_flat = df.reset_index()
         
-    except Exception as e:
-        print(f"\nCRITICAL ERROR: Could not inspect Weather Zarr. \n{e}")
-        return
+        # Aggregate logic
+        fire_events = df_flat.groupby('fireID').agg({
+            't': ['min', 'max'],
+            'hull': combine_geoms
+        }).reset_index()
 
-    # 3. Parallel Execution
-    print(f"Starting parallel download with {N_JOBS} workers...")
-    
-    results = Parallel(n_jobs=N_JOBS)(
-        delayed(process_fire_worker)(
-            row, HRRR_URL, OUTPUT_DIR, df.crs, weather_crs
+        fire_events.columns = ['fireID', 't_start', 't_end', 'geometry']
+        valid_fires = fire_events[fire_events['t_start'] >= pd.to_datetime(START_DATE)].copy()
+
+        # --- APPLY TEST LIMIT (IF ANY) ---
+        if TEST_LIMIT:
+            print(f"\n!!! TEST MODE ENABLED: Processing only first {TEST_LIMIT} fires !!!\n")
+            valid_fires = valid_fires.head(TEST_LIMIT)
+
+        print(f"Unique fires to process in {year}: {len(valid_fires)}")
+
+        # 2. Get Weather CRS (One-time check)
+        print("Getting Weather CRS...", end=" ")
+        try:
+            with xr.open_zarr(HRRR_URL, decode_coords="all", storage_options={'ssl': False}) as ds:
+                weather_crs = ds.rio.crs
+            print("Done.")
+
+        except Exception as e:
+            print(f"\nCRITICAL ERROR: Could not inspect Weather Zarr. \n{e}")
+            return
+
+        # 3. Parallel Execution
+        print(f"Starting parallel download for {year} with {N_JOBS} workers...")
+        
+        results = Parallel(n_jobs=N_JOBS)(
+            delayed(process_fire_worker)(
+                row, HRRR_URL, BASE_OUTPUT_DIR, df.crs, weather_crs, year
+            )
+            for index, row in tqdm(valid_fires.iterrows(), total=len(valid_fires), desc=f"Processing year {year}")
         )
-        for index, row in tqdm(valid_fires.iterrows(), total=len(valid_fires))
-    )
 
-    print("\n" + "="*30)
-    print("DOWNLOAD COMPLETE")
-    print("="*30)
-    counts = Counter(results)
-    for status, count in counts.items():
-        if "SKIPPED_OUT_OF_BOUNDS" in status:
-            print(f"SKIPPED_OUT_OF_BOUNDS: {count}")
-        else:
-            print(f"{status}: {count}")
+        print("\n" + "="*30)
+        print(f"DOWNLOAD COMPLETE for {year}")
+        print("="*30)
+        counts = Counter(results)
+        for status, count in counts.items():
+            if "SKIPPED_OUT_OF_BOUNDS" in status:
+                print(f"SKIPPED_OUT_OF_BOUNDS for {year}: {count}")
+            else:
+                print(f"{status} for {year}: {count}")
 
 if __name__ == "__main__":
     main()
