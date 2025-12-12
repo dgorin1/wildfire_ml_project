@@ -8,25 +8,8 @@ from shapely.ops import unary_union
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from collections import Counter
+from config import YEARS, RAW_FIRE_DATA_DIR, RAW_WEATHER_ZARR_DIR, START_DATE, HRRR_URL, N_JOBS, BUFFER_METERS, TEST_LIMIT
 import warnings
-
-# --- WARNING SUPPRESSION ---
-warnings.filterwarnings("ignore", message=".*Consolidated metadata.*")
-warnings.filterwarnings('ignore')
-
-# --- CONFIGURATION ---
-YEARS = [2018, 2019, 2020, 2021]  # List of years to process
-INPUT_DIR = "data"  # Base directory for input files
-BASE_OUTPUT_DIR = "data/raw_weather_zarr"  # Base output directory
-START_DATE = "2018-07-15"
-
-HRRR_URL = "https://data.dynamical.org/noaa/hrrr/forecast-48-hour/latest.zarr"
-
-N_JOBS = 8          # 12 
-BUFFER_METERS = 2200 # 2.2km buffer guarantees capturing grid points
-
-# !!! FULL RUN SETTING !!!
-TEST_LIMIT = None    # Set to None to process ALL files.
 
 # --- HELPER FUNCTIONS ---
 
@@ -124,7 +107,7 @@ def main():
     print("Loading and aggregating Fire Events...")
     for year in YEARS:
         print(f"Processing year {year}...")
-        input_data = os.path.join(INPUT_DIR, f"feds_western_us_{year}_af_postprocessed.parquet")
+        input_data = os.path.join(RAW_FIRE_DATA_DIR, f"feds_western_us_{year}_af_postprocessed.parquet")
         df = gpd.read_parquet(input_data) 
         df_flat = df.reset_index()
         
@@ -160,7 +143,7 @@ def main():
         
         results = Parallel(n_jobs=N_JOBS)(
             delayed(process_fire_worker)(
-                row, HRRR_URL, BASE_OUTPUT_DIR, df.crs, weather_crs, year
+                row, HRRR_URL, RAW_WEATHER_ZARR_DIR, df.crs, weather_crs, year
             )
             for index, row in tqdm(valid_fires.iterrows(), total=len(valid_fires), desc=f"Processing year {year}")
         )

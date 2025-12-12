@@ -7,25 +7,8 @@ import rioxarray
 from geocube.api.core import make_geocube
 from tqdm import tqdm
 from shapely.ops import unary_union
+from config import YEARS, RAW_FIRE_DATA_DIR, RASTERIZED_FIRES_DIR, EXAMPLE_WEATHER_PATH, BUFFER_METERS, GRID_SIZE_METERS
 import warnings
-
-# --- WARNING SUPPRESSION ---
-warnings.filterwarnings('ignore')
-
-# -----------------------------
-# CONFIGURATION
-# -----------------------------
-YEARS = [2018, 2019, 2020, 2021]
-
-# Base paths
-BASE_INPUT_DIR = "data/raw_fire_data"
-BASE_OUTPUT_DIR = "data/rasterized_fires"
-
-# Reference weather file to get the correct Projection (CRS)
-# This file must exist. If 2019 isn't available, point this to any existing weather Zarr.
-EXAMPLE_WEATHER_PATH = "data/raw_weather_zarr/2019/fireID_11_weather.zarr"
-
-BUFFER_METERS = 2200  # Must match the buffer used in the weather download step
 
 # -----------------------------
 # HELPER FUNCTIONS
@@ -44,8 +27,8 @@ def process_year(year, target_crs):
     """
     # 1. Setup Paths
     input_file = f"feds_western_us_{year}_af_postprocessed.parquet"
-    input_path = os.path.join(BASE_INPUT_DIR, input_file)
-    output_dir = os.path.join(BASE_OUTPUT_DIR, str(year))
+    input_path = os.path.join(RAW_FIRE_DATA_DIR, input_file)
+    output_dir = os.path.join(RASTERIZED_FIRES_DIR, str(year))
     
     if not os.path.exists(input_path):
         print(f"Skipping {year}: File not found ({input_path})")
@@ -83,8 +66,8 @@ def process_year(year, target_crs):
             
             # B. Create the Target Grid (500m Resolution)
             #    Using np.arange to snap to a clean grid starting from the bounds
-            x_coords = np.arange(minx, maxx, 500)
-            y_coords = np.arange(maxy, miny, -500) # Max -> Min for Y
+            x_coords = np.arange(minx, maxx, GRID_SIZE_METERS)
+            y_coords = np.arange(maxy, miny, -GRID_SIZE_METERS) # Max -> Min for Y
             
             #    Skip if grid is empty (edge case for tiny/invalid geometries)
             if len(x_coords) == 0 or len(y_coords) == 0:
