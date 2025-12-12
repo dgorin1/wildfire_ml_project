@@ -1,14 +1,27 @@
-import os
-import time
-import pandas as pd
-import geopandas as gpd
-import xarray as xr
-import rioxarray
-from shapely.ops import unary_union
-from joblib import Parallel, delayed
-from tqdm import tqdm
+import yaml
 from collections import Counter
-from config import YEARS, RAW_FIRE_DATA_DIR, RAW_WEATHER_ZARR_DIR, START_DATE, HRRR_URL, N_JOBS, BUFFER_METERS, TEST_LIMIT
+from tqdm import tqdm
+from joblib import Parallel, delayed
+from shapely.ops import unary_union
+import rioxarray
+import xarray as xr
+import geopandas as gpd
+import pandas as pd
+import time
+import os
+
+
+with open("pipeline/config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+YEARS = config["YEARS"]
+RAW_FIRE_DATA_DIR = config["RAW_FIRE_DATA_DIR"]
+RAW_WEATHER_ZARR_DIR = config["RAW_WEATHER_ZARR_DIR"]
+START_DATE = config["START_DATE"]
+HRRR_URL = config["HRRR_URL"]
+N_JOBS = config["N_JOBS"]
+BUFFER_METERS = config["BUFFER_METERS"]
+TEST_LIMIT = config["TEST_LIMIT"]
 import warnings
 
 # --- HELPER FUNCTIONS ---

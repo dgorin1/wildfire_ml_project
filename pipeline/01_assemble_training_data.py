@@ -1,13 +1,23 @@
-import os
-import numpy as np
-import pandas as pd
-import geopandas as gpd
-import xarray as xr
-import rioxarray
-from geocube.api.core import make_geocube
-from tqdm import tqdm
 from shapely.ops import unary_union
-from config import YEARS, RAW_FIRE_DATA_DIR, RASTERIZED_FIRES_DIR, EXAMPLE_WEATHER_PATH, BUFFER_METERS, GRID_SIZE_METERS
+from tqdm import tqdm
+from geocube.api.core import make_geocube
+import rioxarray
+import xarray as xr
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import os
+import yaml
+
+with open("pipeline/config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+YEARS = config["YEARS"]
+RAW_FIRE_DATA_DIR = config["RAW_FIRE_DATA_DIR"]
+RASTERIZED_FIRES_DIR = config["RASTERIZED_FIRES_DIR"]
+EXAMPLE_WEATHER_PATH = config["EXAMPLE_WEATHER_PATH"]
+BUFFER_METERS = config["BUFFER_METERS"]
+GRID_SIZE_METERS = config["GRID_SIZE_METERS"]
 import warnings
 
 # -----------------------------
