@@ -15,7 +15,7 @@ import rasterio
 from rasterio.features import rasterize
 from xrspatial import slope # Keeping this import for the future enrichment step
 
-# Load up the configuration file
+# Load up my configuration file
 with open("pipeline/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -41,7 +41,7 @@ def combine_geoms(series):
 
 def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs, year):
     # Network handling
-    MAX_RETRIES = 30 # Bumped this up to 30 to handle connection flakiness
+    MAX_RETRIES = 5 # Bumped this to 5 so it actually completes
     RETRY_DELAY = 5
     TARGET_RES = 500  # Sticking to 500m resolution for now
     
@@ -138,6 +138,15 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
             # Attach the mask to the dataset
             weather_500m['fire_mask'] = (('y', 'x'), mask_arr)
             
+            # 5. Save results
+            year_output_folder = os.path.join(output_folder, str(year))
+            os.makedirs(year_output_folder, exist_ok=True)
+
+            file_name = f"fireID_{fire_id}_weather_{year}.zarr"
+            save_path = os.path.join(year_output_folder, file_name)
+            
+            weather_500m.to_zarr(save_path, mode='w', consolidated=False)
+
             return "SUCCESS"
 
         except Exception as e:
@@ -151,7 +160,7 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
 # --- Main Pipeline Execution ---
 
 def main():
-    print("--- PIPELINE STEP 1: WEATHER DOWNLOAD (LOCAL DEM EDITION) ---")
+    print("--- PIPELINE STEP 1: WEATHER DOWNLOAD and Fire Alignment ---")
     
     # 1. Grab the CO shapefile
     print("Loading Colorado boundary...", end=" ")

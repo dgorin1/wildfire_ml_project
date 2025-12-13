@@ -17,6 +17,6 @@ START_DATE: "2018-07-15"
 HRRR_URL: "https://data.dynamical.org/noaa/hrrr/forecast-48-hour/latest.zarr"
 
 N_JOBS: 8
-TEST_LIMIT: None
+TEST_LIMIT: null
 
 JSON_PATH:  "data/state_boundaries/gz_2010_us_040_00_500k.json"
