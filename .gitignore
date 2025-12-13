@@ -8,3 +8,4 @@
 venv/
 
 *.zarr
+*.tif
