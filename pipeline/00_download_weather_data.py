@@ -3,6 +3,7 @@ from collections import Counter
 from tqdm import tqdm
 from joblib import Parallel, delayed
 from shapely.ops import unary_union
+from shapely.geometry import box # Needed for the new box logic
 import rioxarray
 import xarray as xr
 import geopandas as gpd
@@ -13,7 +14,7 @@ import warnings
 import numpy as np
 import rasterio
 from rasterio.features import rasterize
-from xrspatial import slope # Keeping this import for the future enrichment step
+from xrspatial import slope 
 
 # Load up my configuration file
 with open("pipeline/config.yaml", "r") as f:
@@ -25,14 +26,16 @@ RAW_WEATHER_ZARR_DIR = config["RAW_WEATHER_ZARR_DIR"]
 START_DATE = config["START_DATE"]
 HRRR_URL = config["HRRR_URL"]
 N_JOBS = config["N_JOBS"]
-BUFFER_METERS = config["BUFFER_METERS"]
+# BUFFER_METERS is ignored now in favor of fixed 100km grid
 TEST_LIMIT = config["TEST_LIMIT"]
 JSON_PATH = config["JSON_PATH"]
 
 # --- Local DEM Settings ---
-# Note: I'm skipping the DEM processing in this run to speed things up,
-# but I'll need this path later for the enrichment script.
 LOCAL_DEM_PATH = "data/static/colorado_dem_copernicus.tif"
+
+# --- Constants ---
+FIXED_WINDOW_SIZE_METERS = 100000 # 100 km box
+HALF_WINDOW = FIXED_WINDOW_SIZE_METERS / 2
 
 # --- Helper Functions ---
 
@@ -41,9 +44,9 @@ def combine_geoms(series):
 
 def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs, year):
     # Network handling
-    MAX_RETRIES = 5 # Bumped this to 5 so it actually completes
+    MAX_RETRIES = 5 
     RETRY_DELAY = 5
-    TARGET_RES = 500  # Sticking to 500m resolution for now
+    TARGET_RES = 1000  # 1km resolution to match the paper
     
     fire_id = int(row['fireID'])
     
@@ -70,11 +73,18 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
             fire_gs = gpd.GeoSeries([row['geometry']], crs=input_crs)
             fire_proj = fire_gs.to_crs(weather_crs)
             
-            # Calculate bounds with the safety buffer
-            min_x, min_y, max_x, max_y = fire_proj.buffer(BUFFER_METERS).total_bounds
-
+            # --- NEW: CENTROID-BASED CROPPING ---
+            # 1. Get Centroid
+            centroid = fire_proj.geometry.iloc[0].centroid
+            c_x, c_y = centroid.x, centroid.y
+            
+            # 2. Create fixed 100km box around centroid
+            min_x = c_x - HALF_WINDOW
+            max_x = c_x + HALF_WINDOW
+            min_y = c_y - HALF_WINDOW
+            max_y = c_y + HALF_WINDOW
+            
             # Step A: Coarse crop (Spatial)
-            # Grab a rough chunk of the weather data first
             subset_spatial = ds.sel(
                 x=slice(min_x, max_x),
                 y=slice(max_y, min_y)
@@ -87,7 +97,7 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
                 method="nearest"
             )
 
-            # Sanity checks - skip if the slice is empty
+            # Sanity checks
             if subset.sizes['x'] == 0 or subset.sizes['y'] == 0:
                 return f"SKIPPED_OUT_OF_BOUNDS"
             
@@ -95,7 +105,6 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
                 return "SKIPPED_NO_TIME_MATCH"
 
             # Filter Variables
-            # Only keeping the features needed for the model
             vars_to_keep = [
                 'temperature_2m', 'relative_humidity_2m', 'wind_u_10m', 'wind_v_10m', 
                 'precipitation_surface', 'total_cloud_cover_atmosphere',
@@ -106,25 +115,20 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
 
             # --- Resolution Matching & Mask Generation ---
 
-            # 1. Create the target 500m grid
-            coarse_x = subset.x.values
-            coarse_y = subset.y.values
-            
-            # Generate new coordinates
-            new_x = np.arange(coarse_x.min(), coarse_x.max(), TARGET_RES)
+            # 1. Create the target 1000m grid explicitly using the fixed bounds
+            # This ensures every single file has the exact same dimensions
+            new_x = np.arange(min_x, max_x, TARGET_RES)
             
             # Handle Y-axis orientation (HRRR is usually decreasing Y)
-            if coarse_y[1] < coarse_y[0]:
-                new_y = np.arange(coarse_y.max(), coarse_y.min(), -TARGET_RES)
-            else:
-                new_y = np.arange(coarse_y.min(), coarse_y.max(), TARGET_RES)
+            # We enforce the fixed bounds here too
+            new_y = np.arange(max_y, min_y, -TARGET_RES) 
 
-            # 2. Interpolate weather data to the new grid (Nearest Neighbor)
-            weather_500m = subset.interp(x=new_x, y=new_y, method="nearest")
+            # 2. Upsample/Interpolate Weather
+            weather_1km = subset.interp(x=new_x, y=new_y, method="nearest")
             
-            # 3. Create the binary fire mask
-            transform = weather_500m.rio.transform()
-            out_shape = (weather_500m.sizes['y'], weather_500m.sizes['x'])
+            # 3. Rasterize Fire Mask
+            transform = weather_1km.rio.transform()
+            out_shape = (weather_1km.sizes['y'], weather_1km.sizes['x'])
             
             mask_arr = rasterize(
                 [(fire_proj.geometry.iloc[0], 1)],
@@ -135,8 +139,8 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
                 dtype='uint8'
             )
             
-            # Attach the mask to the dataset
-            weather_500m['fire_mask'] = (('y', 'x'), mask_arr)
+            # Attach the mask
+            weather_1km['fire_mask'] = (('y', 'x'), mask_arr)
             
             # 5. Save results
             year_output_folder = os.path.join(output_folder, str(year))
@@ -145,7 +149,7 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
             file_name = f"fireID_{fire_id}_weather_{year}.zarr"
             save_path = os.path.join(year_output_folder, file_name)
             
-            weather_500m.to_zarr(save_path, mode='w', consolidated=False)
+            weather_1km.to_zarr(save_path, mode='w', consolidated=False)
 
             return "SUCCESS"
 
@@ -160,7 +164,7 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
 # --- Main Pipeline Execution ---
 
 def main():
-    print("--- PIPELINE STEP 1: WEATHER DOWNLOAD and Fire Alignment ---")
+    print("--- PIPELINE STEP 1: WEATHER DOWNLOAD (FIXED 100KM GRID) ---")
     
     # 1. Grab the CO shapefile
     print("Loading Colorado boundary...", end=" ")
@@ -203,6 +207,22 @@ def main():
         # Filter for Colorado
         co_proj = co_boundary.to_crs(valid_fires.crs)
         valid_fires = valid_fires[valid_fires.intersects(co_proj.geometry.iloc[0])]
+        
+        # --- NEW: FILTER OVERSIZED FIRES ---
+        print("Filtering oversized fires...", end=" ")
+        bounds = valid_fires.geometry.bounds
+        valid_fires['width_m'] = bounds['maxx'] - bounds['minx']
+        valid_fires['height_m'] = bounds['maxy'] - bounds['miny']
+        
+        # Drop fires larger than 100km in any dimension
+        initial_count = len(valid_fires)
+        valid_fires = valid_fires[
+            (valid_fires['width_m'] <= FIXED_WINDOW_SIZE_METERS) & 
+            (valid_fires['height_m'] <= FIXED_WINDOW_SIZE_METERS)
+        ].copy()
+        
+        dropped_count = initial_count - len(valid_fires)
+        print(f"Done. Dropped {dropped_count} fires > 100km.")
         
         print(f"  Fires remaining in Colorado: {len(valid_fires)}")
         
