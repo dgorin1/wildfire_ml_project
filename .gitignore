@@ -20,3 +20,5 @@ Tif/
 *.ovr
 *.vat.*
 *.aux.xml
+
+static/
