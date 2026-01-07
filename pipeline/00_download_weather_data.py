@@ -115,7 +115,7 @@ def process_fire_worker(row, fire_rows, weather_url, output_folder, input_crs, w
 
             # --- Resolution Matching & Mask Generation ---
 
-            # 1. Create the target 1000m grid explicitly using the fixed bounds [cite: 80, 84]
+            # 1. Create the target 1000m grid explicitly using the fixed bounds 
             # This ensures every single file has the exact same dimensions
             num_points = int(FIXED_WINDOW_SIZE_METERS / TARGET_RES)
             new_x = np.linspace(min_x, max_x, num_points, endpoint=False)
