@@ -9,3 +9,14 @@ venv/
 
 *.zarr
 *.tif
+
+# Ignore the entire Tif directory
+Tif/
+
+
+# Ignore raster data and sidecar files
+*.tif
+*.tfw
+*.ovr
+*.vat.*
+*.aux.xml

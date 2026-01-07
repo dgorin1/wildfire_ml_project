@@ -8,15 +8,15 @@ RAW_WEATHER_ZARR_DIR: "data/raw_weather_zarr"
 
 # Reference weather file to get the correct Projection (CRS)
 # This file must exist. If 2019 isn't available, point this to any existing weather Zarr.
-EXAMPLE_WEATHER_PATH: "data/raw_weather_zarr/2019/fireID_11_weather.zarr"
+# EXAMPLE_WEATHER_PATH: "data/raw_weather_zarr/2019/fireID_11_weather.zarr"
 
-BUFFER_METERS: 50000  # Must match the buffer used in the weather download step
+BUFFER_METERS: 50000  
 GRID_SIZE_METERS: 1000
 
 START_DATE: "2018-07-15"
 HRRR_URL: "https://data.dynamical.org/noaa/hrrr/forecast-48-hour/latest.zarr"
 
-N_JOBS: 8
+N_JOBS: 1
 TEST_LIMIT: null
 
 JSON_PATH:  "data/state_boundaries/gz_2010_us_040_00_500k.json"

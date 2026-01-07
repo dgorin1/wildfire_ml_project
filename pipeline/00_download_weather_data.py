@@ -34,7 +34,7 @@ JSON_PATH = config["JSON_PATH"]
 LOCAL_DEM_PATH = "data/static/colorado_dem_copernicus.tif"
 
 # --- Constants ---
-FIXED_WINDOW_SIZE_METERS = 100000 # 100 km box
+FIXED_WINDOW_SIZE_METERS = 100000 # 100 km box [cite: 84]
 HALF_WINDOW = FIXED_WINDOW_SIZE_METERS / 2
 
 # --- Helper Functions ---
@@ -42,11 +42,11 @@ HALF_WINDOW = FIXED_WINDOW_SIZE_METERS / 2
 def combine_geoms(series):
     return unary_union(series)
 
-def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs, year):
+def process_fire_worker(row, fire_rows, weather_url, output_folder, input_crs, weather_crs, year):
     # Network handling
-    MAX_RETRIES = 5 
-    RETRY_DELAY = 5
-    TARGET_RES = 1000  # 1km resolution to match the paper
+    MAX_RETRIES = 10
+    BASE_DELAY = 5
+    TARGET_RES = 1000  # 1km resolution to match the paper [cite: 80]
     
     fire_id = int(row['fireID'])
     
@@ -54,7 +54,7 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
     init_times = pd.date_range(
         start=row['t_start'], 
         end=row['t_end'], 
-        freq='12h'
+        freq='12h' # 12h temporal resolution [cite: 69]
     )
     
     forecast_deltas = [
@@ -73,12 +73,12 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
             fire_gs = gpd.GeoSeries([row['geometry']], crs=input_crs)
             fire_proj = fire_gs.to_crs(weather_crs)
             
-            # --- NEW: CENTROID-BASED CROPPING ---
+            # --- CENTROID-BASED CROPPING ---
             # 1. Get Centroid
             centroid = fire_proj.geometry.iloc[0].centroid
             c_x, c_y = centroid.x, centroid.y
             
-            # 2. Create fixed 100km box around centroid
+            # 2. Create fixed 100km box around centroid [cite: 84]
             min_x = c_x - HALF_WINDOW
             max_x = c_x + HALF_WINDOW
             min_y = c_y - HALF_WINDOW
@@ -104,7 +104,7 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
             if subset.sizes['init_time'] == 0:
                 return "SKIPPED_NO_TIME_MATCH"
 
-            # Filter Variables
+            # Filter Variables [cite: 66, 77]
             vars_to_keep = [
                 'temperature_2m', 'relative_humidity_2m', 'wind_u_10m', 'wind_v_10m', 
                 'precipitation_surface', 'total_cloud_cover_atmosphere',
@@ -115,32 +115,44 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
 
             # --- Resolution Matching & Mask Generation ---
 
-            # 1. Create the target 1000m grid explicitly using the fixed bounds
+            # 1. Create the target 1000m grid explicitly using the fixed bounds [cite: 80, 84]
             # This ensures every single file has the exact same dimensions
-            new_x = np.arange(min_x, max_x, TARGET_RES)
-            
-            # Handle Y-axis orientation (HRRR is usually decreasing Y)
-            # We enforce the fixed bounds here too
-            new_y = np.arange(max_y, min_y, -TARGET_RES) 
+            num_points = int(FIXED_WINDOW_SIZE_METERS / TARGET_RES)
+            new_x = np.linspace(min_x, max_x, num_points, endpoint=False)
+            new_y = np.linspace(max_y, min_y, num_points, endpoint=False)
 
-            # 2. Upsample/Interpolate Weather
-            weather_1km = subset.interp(x=new_x, y=new_y, method="nearest")
+            # 2. Upsample/Interpolate Weather 
+            # Updated from "nearest" to "linear" to match bi-linear interpolation in paper 
+            weather_1km = subset.interp(x=new_x, y=new_y, method="linear")
             
             # 3. Rasterize Fire Mask
             transform = weather_1km.rio.transform()
             out_shape = (weather_1km.sizes['y'], weather_1km.sizes['x'])
             
-            mask_arr = rasterize(
-                [(fire_proj.geometry.iloc[0], 1)],
-                out_shape=out_shape,
-                transform=transform,
-                fill=0,
-                all_touched=True,
-                dtype='uint8'
-            )
+            # Project the detailed fire history to match weather CRS
+            fire_rows_gdf = gpd.GeoDataFrame(fire_rows, geometry='hull', crs=input_crs)
+            fire_rows_proj = fire_rows_gdf.to_crs(weather_crs)
+            # Ensure time column is datetime for comparison
+            fire_rows_proj['t'] = pd.to_datetime(fire_rows_proj['t'])
+            
+            # Generate a time-dependent mask for each init_time
+            masks = []
+            for t in weather_1km.init_time.values:
+                ts = pd.to_datetime(t)
+                # Filter for fire polygons that existed at or before this time (Cumulative) [cite: 357]
+                valid_polys = fire_rows_proj[fire_rows_proj['t'] <= ts]
+                
+                if valid_polys.empty:
+                    mask_arr = np.zeros(out_shape, dtype='uint8')
+                else:
+                    shapes = [(g, 1) for g in valid_polys.geometry]
+                    # 1 for burned pixels and 0 for non-burned pixels [cite: 82]
+                    mask_arr = rasterize(shapes, out_shape=out_shape, transform=transform, fill=0, all_touched=True, dtype='uint8')
+                
+                masks.append(mask_arr)
             
             # Attach the mask
-            weather_1km['fire_mask'] = (('y', 'x'), mask_arr)
+            weather_1km['fire_mask'] = (('init_time', 'y', 'x'), np.stack(masks))
             
             # 5. Save results
             year_output_folder = os.path.join(output_folder, str(year))
@@ -156,7 +168,8 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
         except Exception as e:
             error_msg = str(e)
             if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
+                # Linear backoff: 5s, 10s, 15s...
+                time.sleep(BASE_DELAY * (attempt + 1))
                 continue
             else:
                 return f"ERROR after {MAX_RETRIES} attempts: {error_msg}"
@@ -166,19 +179,6 @@ def process_fire_worker(row, weather_url, output_folder, input_crs, weather_crs,
 def main():
     print("--- PIPELINE STEP 1: WEATHER DOWNLOAD (FIXED 100KM GRID) ---")
     
-    # 1. Grab the CO shapefile
-    print("Loading Colorado boundary...", end=" ")
-    try:
-        states_gdf = gpd.read_file(JSON_PATH)
-        co_boundary = states_gdf[states_gdf['NAME'] == 'Colorado']
-        if co_boundary.empty:
-            print("\nError: 'Colorado' not found in state boundary file.")
-            return
-        print("Done.")
-    except Exception as e:
-        print(f"\nError loading state boundary: {e}")
-        return
-
     # 2. Loop through the fire years
     print("Loading and aggregating Fire Events...")
     for year in YEARS:
@@ -189,9 +189,13 @@ def main():
             print(f"  Skipping {year}: Input file not found.")
             continue
 
-        # Read the raw fire data
+        # Read the raw fire data [cite: 54, 69]
         df = gpd.read_parquet(input_data) 
         df_flat = df.reset_index()
+        df_flat['t'] = pd.to_datetime(df_flat['t'])
+        
+        # Create a lookup for raw fire rows to pass to workers
+        fire_groups = df_flat.groupby('fireID')
         
         # Group fire pixels into single events
         fire_events = df_flat.groupby('fireID').agg({
@@ -204,17 +208,13 @@ def main():
         valid_fires = gpd.GeoDataFrame(fire_events, geometry='geometry', crs=df.crs)
         valid_fires = valid_fires[valid_fires['t_start'] >= pd.to_datetime(START_DATE)].copy()
 
-        # Filter for Colorado
-        co_proj = co_boundary.to_crs(valid_fires.crs)
-        valid_fires = valid_fires[valid_fires.intersects(co_proj.geometry.iloc[0])]
-        
-        # --- NEW: FILTER OVERSIZED FIRES ---
+        # --- FILTER OVERSIZED FIRES ---
         print("Filtering oversized fires...", end=" ")
         bounds = valid_fires.geometry.bounds
         valid_fires['width_m'] = bounds['maxx'] - bounds['minx']
         valid_fires['height_m'] = bounds['maxy'] - bounds['miny']
         
-        # Drop fires larger than 100km in any dimension
+        # Drop fires larger than 100km in any dimension [cite: 84]
         initial_count = len(valid_fires)
         valid_fires = valid_fires[
             (valid_fires['width_m'] <= FIXED_WINDOW_SIZE_METERS) & 
@@ -224,7 +224,16 @@ def main():
         dropped_count = initial_count - len(valid_fires)
         print(f"Done. Dropped {dropped_count} fires > 100km.")
         
-        print(f"  Fires remaining in Colorado: {len(valid_fires)}")
+        # --- FILTER SMALL FIRES ---
+        print("Filtering small fires (< 4km^2)...", end=" ")
+        valid_fires['area_m2'] = valid_fires.geometry.area
+        # 4 km^2 = 4,000,000 m^2 [cite: 69]
+        initial_count_small = len(valid_fires)
+        valid_fires = valid_fires[valid_fires['area_m2'] >= 4_000_000].copy()
+        dropped_small = initial_count_small - len(valid_fires)
+        print(f"Done. Dropped {dropped_small} fires < 4km^2.")
+        
+        print(f"  Fires remaining: {len(valid_fires)}")
         
         if len(valid_fires) == 0:
             continue
@@ -236,20 +245,27 @@ def main():
 
         # 4. Inspect the Weather Zarr for CRS
         print("Getting Weather CRS...", end=" ")
-        try:
-            with xr.open_zarr(HRRR_URL, decode_coords="all", storage_options={'ssl': False}) as ds:
-                weather_crs = ds.rio.crs
-            print("Done.")
-        except Exception as e:
-            print(f"\nCRITICAL ERROR: Could not inspect Weather Zarr. \n{e}")
-            return
+        weather_crs = None
+        for attempt in range(5):
+            try:
+                with xr.open_zarr(HRRR_URL, decode_coords="all", storage_options={'ssl': False}) as ds:
+                    weather_crs = ds.rio.crs
+                print("Done.")
+                break
+            except Exception as e:
+                if attempt < 4:
+                    print(f"(retry {attempt+1})...", end=" ", flush=True)
+                    time.sleep(2)
+                else:
+                    print(f"\nCRITICAL ERROR: Could not inspect Weather Zarr. \n{e}")
+                    return
 
         # 5. Kick off parallel workers
         print(f"Starting parallel download for {year} with {N_JOBS} workers...")
         
         results = Parallel(n_jobs=N_JOBS)(
             delayed(process_fire_worker)(
-                row, HRRR_URL, RAW_WEATHER_ZARR_DIR, df.crs, weather_crs, year
+                row, fire_groups.get_group(row['fireID']), HRRR_URL, RAW_WEATHER_ZARR_DIR, df.crs, weather_crs, year
             )
             for index, row in tqdm(valid_fires.iterrows(), total=len(valid_fires), desc=f"Processing year {year}")
         )
@@ -267,7 +283,7 @@ def main():
             if "SKIPPED_OUT_OF_BOUNDS" in status:
                 print(f"SKIPPED_OUT_OF_BOUNDS for {year}: {count}")
             else:
-                print(f"{status} for {year}: {count}")
+                print(status + f" for {year}: {count}")
 
 if __name__ == "__main__":
     main()
