@@ -10,13 +10,75 @@ RAW_WEATHER_ZARR_DIR: "data/raw_weather_zarr"
 # This file must exist. If 2019 isn't available, point this to any existing weather Zarr.
 # EXAMPLE_WEATHER_PATH: "data/raw_weather_zarr/2019/fireID_11_weather.zarr"
 
-BUFFER_METERS: 50000  
-GRID_SIZE_METERS: 1000
 
 START_DATE: "2018-07-15"
 HRRR_URL: "https://data.dynamical.org/noaa/hrrr/forecast-48-hour/latest.zarr"
 
-N_JOBS: 1
+N_DOWNLOAD_WORKERS: 4  # parallel threads for weather download (tune to your bandwidth)
 TEST_LIMIT: null
 
 JSON_PATH:  "data/state_boundaries/gz_2010_us_040_00_500k.json"
+
+FIXED_WINDOW_SIZE_METERS : 100000
+
+TARGET_RES: 1000  # 1km grid resolution for weather data
+
+
+# =============================================================
+# Script 02: Terrain data (py3dep / USGS 3DEP)
+# =============================================================
+DEM_RESOLUTION_M: 30  # 30m native, bilinearly resampled to 1km
+
+
+# =============================================================
+# Script 03: Training sample assembly
+# =============================================================
+TRAINING_DATA_DIR: "data/training_samples"
+WEATHER_LEAD_TIME_HOURS: 12        # forecast lead time to use as input weather
+MIN_TIMESTEPS_PER_FIRE: 2          # skip fires with only 1 init_time
+TRAIN_YEARS: [2018, 2019, 2020]
+VAL_YEARS: [2021]
+TEST_YEARS: [2021]
+NORM_STATS_PATH: "data/training_samples/channel_stats.json"
+
+# Channel names in order (for reference and normalization)
+CHANNEL_NAMES:
+  - fire_mask
+  - temperature_2m
+  - relative_humidity_2m
+  - wind_u_10m
+  - wind_v_10m
+  - wind_u_80m
+  - wind_v_80m
+  - precipitation_surface
+  - total_cloud_cover_atmosphere
+  - downward_short_wave_radiation_flux_surface
+  - fuel_load
+  - fuel_depth
+  - moisture_extinction
+  - elevation
+  - slope
+  - aspect_sin
+  - aspect_cos
+
+
+# =============================================================
+# Script 04: Model training
+# =============================================================
+MODEL_DIR: "models"
+N_INPUT_CHANNELS: 17
+UNET_BASE_FILTERS: 64
+UNET_DEPTH: 4
+BATCH_SIZE: 32
+NUM_EPOCHS: 100
+LEARNING_RATE: 0.001
+LR_SCHEDULER: "cosine"
+WEIGHT_DECAY: 0.0001
+EARLY_STOPPING_PATIENCE: 10
+LOSS_FUNCTION: "combo"    # 0.5 * BCE(pos_weight) + 0.5 * Dice
+
+
+# =============================================================
+# Script 05: Evaluation
+# =============================================================
+EVAL_OUTPUT_DIR: "outputs/evaluation"

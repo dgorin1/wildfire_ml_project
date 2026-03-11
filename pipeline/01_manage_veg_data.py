@@ -54,12 +54,16 @@ def create_raw_physics_stack(patch):
 
 def main():
     # Configuration
+    # LF 2016 covers fire seasons through 2016 and is the correct dataset
+    # for 2018/2019 fires (no dedicated LF 2018/2019 release exists).
     FUEL_PATHS = {
+        2018: "data/static/fuel_2016_data/Tif/LF2016_FBFM13_CONUS.tif",
+        2019: "data/static/fuel_2016_data/Tif/LF2016_FBFM13_CONUS.tif",
         2020: "data/static/fuel_2020_data/Tif/LC19_F13_200.tif",
         2021: "data/static/fuel_2021_data/Tif/LC20_F13_200.tif"
     }
     RAW_WEATHER_DIR = "data/raw_weather_zarr"
-    YEARS = [2020, 2021]
+    YEARS = [2018, 2019, 2020, 2021]
 
     for year in YEARS:
         if year not in FUEL_PATHS:
