@@ -28,6 +28,7 @@ TARGET_RES: 1000  # 1km grid resolution for weather data
 # Script 02: Terrain data (py3dep / USGS 3DEP)
 # =============================================================
 DEM_RESOLUTION_M: 30  # 30m native, bilinearly resampled to 1km
+N_TERRAIN_WORKERS: 8  # USGS 3DEP API tolerates more concurrency than HRRR
 
 
 # =============================================================

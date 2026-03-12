@@ -9,6 +9,7 @@ import rioxarray
 from rasterio.enums import Resampling
 from tqdm import tqdm
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xrspatial
 
 try:
@@ -22,6 +23,7 @@ with open("pipeline/config.yaml", "r") as f:
 YEARS = config["YEARS"]
 RAW_WEATHER_ZARR_DIR = config["RAW_WEATHER_ZARR_DIR"]
 DEM_RESOLUTION_M = config.get("DEM_RESOLUTION_M", 30)
+N_TERRAIN_WORKERS = config.get("N_TERRAIN_WORKERS", 8)
 
 MAX_RETRIES = 10
 BASE_DELAY = 5
@@ -152,14 +154,17 @@ def main():
         all_zarr_files.extend(files)
 
     print(f"Found {len(all_zarr_files)} zarr files across years {YEARS}")
+    print(f"Running with {N_TERRAIN_WORKERS} workers...")
 
     counts = Counter()
-    for zarr_path in tqdm(all_zarr_files, desc="Adding terrain"):
-        status = process_zarr_terrain(zarr_path)
-        key = status.split(":")[0]
-        counts[key] += 1
-        if key == "ERROR":
-            tqdm.write(f"  {os.path.basename(zarr_path)}: {status}")
+    with ThreadPoolExecutor(max_workers=N_TERRAIN_WORKERS) as executor:
+        futures = {executor.submit(process_zarr_terrain, p): p for p in all_zarr_files}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Adding terrain"):
+            status = future.result()
+            key = status.split(":")[0]
+            counts[key] += 1
+            if key == "ERROR":
+                tqdm.write(f"  {os.path.basename(futures[future])}: {status}")
 
     print("\nDone.")
     for status, count in sorted(counts.items()):
