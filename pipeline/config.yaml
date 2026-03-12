@@ -14,7 +14,7 @@ RAW_WEATHER_ZARR_DIR: "data/raw_weather_zarr"
 START_DATE: "2018-07-15"
 HRRR_URL: "https://data.dynamical.org/noaa/hrrr/forecast-48-hour/latest.zarr"
 
-N_DOWNLOAD_WORKERS: 4  # parallel threads for weather download (tune to your bandwidth)
+N_DOWNLOAD_WORKERS: 2  # parallel threads for weather download (>2 triggers rate limiting on data.dynamical.org)
 TEST_LIMIT: null
 
 JSON_PATH:  "data/state_boundaries/gz_2010_us_040_00_500k.json"

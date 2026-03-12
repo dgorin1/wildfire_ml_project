@@ -1,6 +1,8 @@
 import yaml
 import warnings
+import shutil
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from shapely.ops import unary_union
 from shapely.geometry import box
@@ -26,6 +28,11 @@ warnings.filterwarnings(
     message="The data type.*does not have a Zarr V3 specification",
     category=UserWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message="Dataset has no geotransform",
+    category=UserWarning,
+)
 
 # Load up my configuration file
 with open("pipeline/config.yaml", "r") as f:
@@ -49,7 +56,30 @@ HALF_WINDOW = FIXED_WINDOW_SIZE_METERS / 2
 def combine_geoms(series):
     return unary_union(series)
 
-def process_fire_worker(row, fire_rows, output_folder, input_crs, weather_crs, year, ds):
+def is_valid_zarr(path):
+    """Return True if zarr exists and contains a complete fire download."""
+    if not os.path.exists(path):
+        return False
+    try:
+        ds = xr.open_zarr(path, consolidated=False)
+        # Must have fire_mask and at least one weather variable
+        if 'fire_mask' not in ds:
+            ds.close()
+            return False
+        weather_vars = ['temperature_2m', 'relative_humidity_2m', 'wind_u_10m']
+        if not any(v in ds for v in weather_vars):
+            ds.close()
+            return False
+        # Spatial grid must be 100×100
+        if ds.sizes.get('x', 0) != 100 or ds.sizes.get('y', 0) != 100:
+            ds.close()
+            return False
+        ds.close()
+        return True
+    except Exception:
+        return False
+
+def process_fire_worker(row, fire_rows, output_folder, input_crs, weather_crs, year, hrrr_url):
     MAX_RETRIES = 10
     BASE_DELAY = 5
     TARGET_RES = 1000
@@ -59,9 +89,15 @@ def process_fire_worker(row, fire_rows, output_folder, input_crs, weather_crs, y
     os.makedirs(year_output_folder, exist_ok=True)
     save_path = os.path.join(year_output_folder, f"fireID_{fire_id}_weather_{year}.zarr")
 
-    # Skip fires already downloaded
+    # Skip fires already fully downloaded; delete and re-download if partial
     if os.path.exists(save_path):
-        return "SKIPPED_EXISTS"
+        if is_valid_zarr(save_path):
+            return "SKIPPED_EXISTS"
+        else:
+            shutil.rmtree(save_path)
+
+    # Each worker opens its own connection to avoid thread-safety issues
+    ds = xr.open_zarr(hrrr_url, decode_coords="all", storage_options={'ssl': False}, chunks={})
 
     init_times = pd.date_range(
         start=row['t_start'],
@@ -120,8 +156,13 @@ def process_fire_worker(row, fire_rows, output_folder, input_crs, weather_crs, y
 
             weather_1km = subset.interp(x=new_x, y=new_y, method="linear")
 
-            transform = weather_1km.rio.transform()
+            # Build transform directly from known grid bounds (avoids identity-matrix
+            # fallback when rioxarray loses CRS context after interp)
             out_shape = (weather_1km.sizes['y'], weather_1km.sizes['x'])
+            transform = rasterio.transform.from_bounds(
+                min_x, min_y, max_x, max_y,
+                out_shape[1], out_shape[0]
+            )
 
             fire_rows_gdf = gpd.GeoDataFrame(fire_rows, geometry='hull', crs=input_crs)
             fire_rows_proj = fire_rows_gdf.to_crs(weather_crs)
@@ -198,7 +239,7 @@ def main():
             valid_fires = valid_fires.head(TEST_LIMIT)
 
         # Get weather CRS from remote dataset
-        weather_crs = None 
+        weather_crs = None
         for attempt in range(5):
             try:
                 with xr.open_zarr(HRRR_URL, decode_coords="all", storage_options={'ssl': False}) as ds:
@@ -207,23 +248,25 @@ def main():
             except Exception:
                 time.sleep(2)
 
-        # Open the remote zarr once per year — reused for every fire
-        print(f"  Opening remote HRRR zarr...")
-        ds = xr.open_zarr(HRRR_URL, decode_coords="all", storage_options={'ssl': False}, chunks={})
-
-        print(f"  Downloading {len(valid_fires)} fires (serial)...")
+        print(f"  Downloading {len(valid_fires)} fires ({N_DOWNLOAD_WORKERS} workers)...")
         results = []
-        for _, row in tqdm(valid_fires.iterrows(), total=len(valid_fires), desc=f"Year {year}"):
-            res = process_fire_worker(
-                row,
-                fire_groups.get_group(row['fireID']),
-                RAW_WEATHER_ZARR_DIR,
-                df.crs,
-                weather_crs,
-                year,
-                ds,
-            )
-            results.append(res)
+        fire_list = list(valid_fires.iterrows())
+        with ThreadPoolExecutor(max_workers=N_DOWNLOAD_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    process_fire_worker,
+                    row,
+                    fire_groups.get_group(row['fireID']),
+                    RAW_WEATHER_ZARR_DIR,
+                    df.crs,
+                    weather_crs,
+                    year,
+                    HRRR_URL,
+                ): row['fireID']
+                for _, row in fire_list
+            }
+            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Year {year}"):
+                results.append(future.result())
 
         print("\n" + "="*30)
         print(f"DOWNLOAD COMPLETE for {year}")
