@@ -29,6 +29,7 @@ import xarray as xr
 import pandas as pd
 from tqdm import tqdm
 from collections import Counter
+from scipy.ndimage import distance_transform_edt
 
 with open("pipeline/config.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -50,7 +51,6 @@ WEATHER_VARS = [
     "wind_v_10m",
     "wind_u_80m",
     "wind_v_80m",
-    "precipitation_surface",
     "total_cloud_cover_atmosphere",
     "downward_short_wave_radiation_flux_surface",
 ]
@@ -80,13 +80,18 @@ def load_zarr_safe(zarr_path):
 
 
 def _fill_nan(arr, name="", nan_log=None):
-    """Replace NaN with channel mean. Records fill info into nan_log if provided."""
-    nan_count = int(np.isnan(arr).sum())
+    """Replace NaN with nearest valid neighbor. Falls back to 0 if entirely NaN."""
+    nan_mask = np.isnan(arr)
+    nan_count = int(nan_mask.sum())
     if nan_count > 0:
-        fill = float(np.nanmean(arr))
+        if nan_count == arr.size:
+            arr = np.zeros_like(arr)
+        else:
+            _, indices = distance_transform_edt(nan_mask, return_indices=True)
+            arr = arr.copy()
+            arr[nan_mask] = arr[tuple(indices[:, nan_mask])]
         if nan_log is not None:
             nan_log.append((name, nan_count))
-        arr = np.where(np.isnan(arr), fill, arr)
     return arr
 
 
@@ -121,8 +126,8 @@ def build_input(ds, t_idx, nan_log=None):
     channels.append(np.sin(aspect_rad).astype(np.float32))
     channels.append(np.cos(aspect_rad).astype(np.float32))
 
-    X = np.stack(channels, axis=0)  # (17, y, x)
-    assert X.shape == (17, 100, 100), f"Unexpected input shape: {X.shape}"
+    X = np.stack(channels, axis=0)  # (N_CHANNELS, y, x)
+    assert X.shape[1:] == (100, 100), f"Unexpected input shape: {X.shape}"
     return X
 
 
@@ -232,25 +237,34 @@ def save_samples_by_fire(samples, output_base_dir, year):
         )
 
 
-def compute_norm_stats(train_years_samples):
+def compute_norm_stats(train_npz_paths):
     """
-    Compute per-channel mean and std from training samples only.
-    Returns a dict suitable for JSON serialization.
+    Compute per-channel mean and std by streaming through saved npz files.
+    Uses a single-pass online algorithm — never loads more than one file at a time.
     """
     n_channels = 17
-    # Accumulate per-channel sums for online mean/std (Welford-style via two-pass)
-    all_X = np.concatenate(
-        [np.stack([s["X"] for s in samples]) for samples in train_years_samples if samples],
-        axis=0,
-    )  # (N_total, 17, 100, 100)
+    ch_sum    = np.zeros(n_channels, dtype=np.float64)
+    ch_sum_sq = np.zeros(n_channels, dtype=np.float64)
+    ch_count  = np.zeros(n_channels, dtype=np.int64)
+
+    for path in tqdm(train_npz_paths, desc="  Computing stats"):
+        data = np.load(path, allow_pickle=False)
+        X = data["X"].astype(np.float64)   # (N, 17, 100, 100)
+        pixels = X.shape[0] * X.shape[2] * X.shape[3]
+        for c in range(n_channels):
+            vals = X[:, c, :, :].ravel()
+            ch_sum[c]    += vals.sum()
+            ch_sum_sq[c] += (vals ** 2).sum()
+            ch_count[c]  += pixels
 
     stats = {}
     for c in range(n_channels):
-        channel_data = all_X[:, c, :, :].ravel()
+        mean = ch_sum[c] / ch_count[c]
+        std  = np.sqrt(ch_sum_sq[c] / ch_count[c] - mean ** 2)
         stats[c] = {
             "name": CHANNEL_NAMES[c],
-            "mean": float(np.mean(channel_data)),
-            "std": float(np.std(channel_data)),
+            "mean": float(mean),
+            "std":  float(std),
         }
     return stats
 
@@ -272,8 +286,11 @@ def main():
 
     # Compute and save normalization stats from training years only
     print("\nComputing normalization statistics from training years...")
-    train_samples = [year_samples[y] for y in TRAIN_YEARS if y in year_samples]
-    stats = compute_norm_stats(train_samples)
+    train_npz_paths = []
+    for y in TRAIN_YEARS:
+        pattern = os.path.join(TRAINING_DATA_DIR, "by_fire", str(y), "*.npz")
+        train_npz_paths.extend(glob.glob(pattern))
+    stats = compute_norm_stats(train_npz_paths)
 
     os.makedirs(os.path.dirname(NORM_STATS_PATH), exist_ok=True)
     with open(NORM_STATS_PATH, "w") as f:

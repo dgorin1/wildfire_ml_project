@@ -51,7 +51,6 @@ CHANNEL_NAMES:
   - wind_v_10m
   - wind_u_80m
   - wind_v_80m
-  - precipitation_surface
   - total_cloud_cover_atmosphere
   - downward_short_wave_radiation_flux_surface
   - fuel_load
@@ -67,7 +66,7 @@ CHANNEL_NAMES:
 # Script 04: Model training
 # =============================================================
 MODEL_DIR: "models"
-N_INPUT_CHANNELS: 17
+N_INPUT_CHANNELS: 16
 UNET_BASE_FILTERS: 64
 UNET_DEPTH: 4
 BATCH_SIZE: 32
