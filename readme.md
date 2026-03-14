@@ -52,10 +52,11 @@ If you are collaborating on the data collection phase:
 
 ##  Next Steps
 
-1.  **Finish Data Ingestion:** Complete the download of weather data for the target fires.
-2.  **Consider adding DEM Data** Need to ingest DEM or slope data for terrain awareness.
-3.  **Data Pairing:** Create training samples that link a specific fire shape at Time A to the weather forecast for Time B.
-4.  **Model Training:** Train a baseline ML model (likely a CNN or ConvLSTM) to see if it can learn the pattern.
+1. **Complete training run** — U-Net training in progress on MPS (Apple Silicon GPU)
+2. **Evaluate on 2021 held-out fires** — recall, precision, F1, IoU
+3. **Switch to Focal Tversky Loss** — α=0.75, β=0.25 as in Zou et al. to better handle class imbalance
+4. **Add canopy fuel channels** — CanopyCover, StandHeight, CanopyBulkDensity, CanopyBaseHeight from LANDFIRE (currently using surface fuels only)
+5. **Add fire attention modules** — FirePolyAttn / FireLineAttn as described in Zou et al.
 
 ---
 
