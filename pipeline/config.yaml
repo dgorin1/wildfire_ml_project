@@ -71,11 +71,11 @@ UNET_BASE_FILTERS: 64
 UNET_DEPTH: 4
 BATCH_SIZE: 32
 NUM_EPOCHS: 100
-LEARNING_RATE: 0.001
+LEARNING_RATE: 0.0001
 LR_SCHEDULER: "cosine"
 WEIGHT_DECAY: 0.0001
 EARLY_STOPPING_PATIENCE: 10
-LOSS_FUNCTION: "combo"    # 0.5 * BCE(pos_weight) + 0.5 * Dice
+LOSS_FUNCTION: "combo"   # ComboLoss: 0.5*BCE(spread_pos_weight) + 0.5*Dice, target=Y_spread
 
 
 # =============================================================

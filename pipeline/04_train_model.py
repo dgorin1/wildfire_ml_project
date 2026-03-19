@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 with open("pipeline/config.yaml", "r") as f:
@@ -44,6 +45,11 @@ VAL_YEARS = config["VAL_YEARS"]
 # Wind channel indices that need sign-flip during augmentation
 WIND_U_CHANNELS = [3, 5]  # wind_u_10m, wind_u_80m
 WIND_V_CHANNELS = [4, 6]  # wind_v_10m, wind_v_80m
+
+# Max npz files to keep decompressed in each worker's in-process cache.
+# Each file ≈ 24 MB (38 samples × 16 ch × 100 × 100 × 4 B).
+# 150 files × 24 MB × 2 workers ≈ 7 GB — manageable on 16 GB+ Macs.
+MAX_CACHE_FILES = 150
 
 
 # =============================================================================
@@ -171,6 +177,33 @@ class ComboLoss(nn.Module):
         return self.alpha * self.bce(logits, targets) + (1.0 - self.alpha) * self.dice(logits, targets)
 
 
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal Tversky Loss as used in Zou et al. (2023) for fire spread.
+
+    Tversky index generalises F1: alpha weights FN (recall), beta weights FP.
+    alpha=0.75, beta=0.25 heavily penalises missing spread pixels (FN),
+    which is appropriate when spread pixels are the rare, high-value class.
+    The focal exponent gamma sharpens focus on hard examples.
+    """
+    def __init__(self, alpha=0.75, beta=0.25, gamma=1.33, smooth=1.0):
+        super().__init__()
+        self.alpha = alpha   # FN weight — emphasises recall of spread pixels
+        self.beta  = beta    # FP weight
+        self.gamma = gamma   # focal sharpening (Zou et al. use 4/3)
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        p = probs.view(-1)
+        t = targets.view(-1)
+        tp = (p * t).sum()
+        fp = (p * (1 - t)).sum()
+        fn = ((1 - p) * t).sum()
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        return (1.0 - tversky) ** self.gamma
+
+
 # =============================================================================
 # Dataset
 # =============================================================================
@@ -188,39 +221,40 @@ class WildfireDataset(Dataset):
         self.augment = augment
         self.channel_stats = channel_stats  # dict: {channel_idx: {"mean": float, "std": float}}
 
-        # Build flat index: (file_idx, sample_within_file)
+        # Build flat index using cumulative offsets for O(log n) lookup
         self.files = []
-        self.offsets = []
-        offset = 0
+        cum_sizes = [0]
         for path in npz_paths:
             data = np.load(path)
             n = data["X"].shape[0]
             self.files.append(path)
-            self.offsets.append((offset, offset + n))
-            offset += n
-        self.total = offset
+            cum_sizes.append(cum_sizes[-1] + n)
+        self.cum_sizes = np.array(cum_sizes)
+        self.total = cum_sizes[-1]
 
-        # Cache for open npz files (lazy load)
-        self._cache = {}
+        # Bounded FIFO cache: stores decompressed (X, Y) arrays per file index.
+        # Capped at MAX_CACHE_FILES entries; oldest entry evicted when full.
+        self._cache = OrderedDict()
 
     def __len__(self):
         return self.total
 
     def _load_file(self, file_idx):
         if file_idx not in self._cache:
-            self._cache[file_idx] = np.load(self.files[file_idx])
+            data = np.load(self.files[file_idx], allow_pickle=False)
+            self._cache[file_idx] = (data["X"], data["Y"])
+            if len(self._cache) > MAX_CACHE_FILES:
+                self._cache.popitem(last=False)  # evict oldest
         return self._cache[file_idx]
 
     def __getitem__(self, idx):
-        # Find which file and local index
-        for file_idx, (start, end) in enumerate(self.offsets):
-            if start <= idx < end:
-                local_idx = idx - start
-                break
+        # Binary search for file index — O(log n) instead of O(n)
+        file_idx = int(np.searchsorted(self.cum_sizes, idx, side="right")) - 1
+        local_idx = idx - self.cum_sizes[file_idx]
 
-        data = self._load_file(file_idx)
-        X = data["X"][local_idx].copy()  # (17, 100, 100) float32
-        Y = data["Y"][local_idx].copy()  # (1,  100, 100) float32
+        X_all, Y_all = self._load_file(file_idx)
+        X = X_all[local_idx].copy()  # (16, 100, 100) float32
+        Y = Y_all[local_idx].copy()  # (1,  100, 100) float32
 
         # Normalize per channel
         for c in range(X.shape[0]):
@@ -272,52 +306,94 @@ def get_npz_paths(years):
     return sorted(paths)
 
 
-def compute_pos_weight(npz_paths, max_files=500):
-    """Estimate BCE pos_weight = n_negative / n_positive from a sample of training files."""
-    n_pos = 0
-    n_neg = 0
+def compute_spread_pos_weight(npz_paths, max_files=500):
+    """
+    Estimate BCE pos_weight for Y_spread = newly burned pixels only.
+    Reads the unnormalized X (fire_mask channel 0 > 0.5 = existing fire) and Y.
+    Y_spread = Y * (1 - existing_fire).
+    Typical result: ~5000-10000x (spread pixels are ~10x rarer than fire pixels).
+    """
+    n_pos = 0.0
+    n_neg = 0.0
     sampled = npz_paths[:max_files] if len(npz_paths) > max_files else npz_paths
     for path in sampled:
-        data = np.load(path)
-        Y = data["Y"]
-        n_pos += Y.sum()
-        n_neg += (1.0 - Y).sum()
+        data = np.load(path, allow_pickle=False)
+        X = data["X"]  # (N, 16, 100, 100) float32 — unnormalized
+        Y = data["Y"]  # (N, 1,  100, 100) float32
+        existing_fire = (X[:, 0:1, :, :] > 0.5).astype(np.float32)
+        Y_spread = Y * (1 - existing_fire)
+        n_pos += float(Y_spread.sum())
+        n_neg += float((1.0 - Y_spread).sum())
     if n_pos == 0:
-        return torch.tensor([20.0])
-    return torch.tensor([n_neg / n_pos])
+        return torch.tensor([500.0])
+    # Cap at 500: balances recall vs precision. 3000 caused extreme false positives
+    # (91% recall but 1.7% precision). Lower cap forces the model to be more selective.
+    raw = n_neg / n_pos
+    return torch.tensor([min(raw, 500.0)])
 
 
 def compute_sample_weights(npz_paths):
     """
-    Assign higher weight to samples where the fire is actively spreading (Y.sum() > 0).
-    Returns a list of per-sample weights for WeightedRandomSampler.
+    Per-sample weights for WeightedRandomSampler.
+    Spreading fire samples (Y_spread > 0) get 10x weight to counteract their rarity.
+    Fire-present-but-not-spreading samples get 2x. No-fire samples get 1x.
     """
     weights = []
     for path in npz_paths:
-        data = np.load(path)
+        data = np.load(path, allow_pickle=False)
+        X = data["X"]
         Y = data["Y"]
+        existing_fire = (X[:, 0:1, :, :] > 0.5).astype(np.float32)
         for i in range(Y.shape[0]):
-            fire_pixels = Y[i].sum()
-            weights.append(2.0 if fire_pixels > 0 else 1.0)
+            spread_pixels = float((Y[i] * (1 - existing_fire[i])).sum())
+            if spread_pixels > 0:
+                weights.append(10.0)   # fire is actively spreading
+            elif Y[i].sum() > 0:
+                weights.append(2.0)    # fire present but static
+            else:
+                weights.append(1.0)    # no fire
     return weights
 
 
-def iou_score(logits, targets, threshold=0.5):
-    preds = (torch.sigmoid(logits) > threshold).float()
-    intersection = (preds * targets).sum().item()
-    union = (preds + targets).clamp(0, 1).sum().item()
-    if union == 0:
-        return 1.0 if intersection == 0 else 0.0
-    return intersection / union
+def batch_metrics(logits, targets, existing_fire=None, threshold=0.5):
+    """
+    Vectorized per-sample IoU, F1, and (optionally) spread IoU for a batch.
 
+    existing_fire: (B, 1, H, W) binary tensor of fire at time T, recovered from
+                   normalized channel 0 (threshold > 1.0 since fire pixels ≈ 26).
+                   If provided, also computes IoU over newly burned pixels only.
 
-def f1_score(logits, targets, threshold=0.5):
-    preds = (torch.sigmoid(logits) > threshold).float()
-    tp = (preds * targets).sum().item()
-    fp = (preds * (1 - targets)).sum().item()
-    fn = ((1 - preds) * targets).sum().item()
-    denom = 2 * tp + fp + fn
-    return (2 * tp / denom) if denom > 0 else 1.0
+    Returns dicts of per-sample numpy arrays (nan where union==0 / no spread).
+    """
+    B = logits.shape[0]
+    preds = (torch.sigmoid(logits) > threshold).float()  # (B, 1, H, W)
+
+    p = preds.view(B, -1)   # (B, N)
+    t = targets.view(B, -1) # (B, N)
+
+    tp        = (p * t).sum(dim=1)
+    fp        = (p * (1 - t)).sum(dim=1)
+    fn        = ((1 - p) * t).sum(dim=1)
+    union     = (p + t).clamp(0, 1).sum(dim=1)
+    denom_f1  = 2 * tp + fp + fn
+
+    nan_val = torch.full((B,), float("nan"), device=logits.device)
+    iou = torch.where(union > 0,   tp / union,          nan_val).cpu().numpy()
+    f1  = torch.where(denom_f1 > 0, 2 * tp / denom_f1, nan_val).cpu().numpy()
+
+    result = {"iou": iou, "f1": f1}
+
+    if existing_fire is not None:
+        # Spread pixels: fire at T+12h that was NOT fire at T
+        spread = targets * (1 - existing_fire)            # (B, 1, H, W)
+        s = spread.view(B, -1)
+        sp_inter = (p * s).sum(dim=1)
+        sp_union = (p + s).clamp(0, 1).sum(dim=1)
+        result["spread_iou"] = torch.where(
+            sp_union > 0, sp_inter / sp_union, nan_val
+        ).cpu().numpy()
+
+    return result
 
 
 # =============================================================================
@@ -325,14 +401,24 @@ def f1_score(logits, targets, threshold=0.5):
 # =============================================================================
 
 def train_epoch(model, loader, optimizer, loss_fn, device):
+    """
+    Train one epoch. Loss is computed against Y_spread (newly burned pixels only),
+    not the full fire mask. This prevents the model from exploiting the trivial
+    fire-persistence solution (copying channel 0 to output).
+    At inference, union model output with the input fire mask to get the full prediction.
+    """
     model.train()
     total_loss = 0.0
     for X, Y in loader:
         X, Y = X.to(device), Y.to(device)
+        # Recover binary fire-at-T: normalized channel 0 → fire≈26.1, no-fire≈-0.04
+        existing_fire = (X[:, 0:1] > 1.0).float()
+        Y_spread = Y * (1 - existing_fire)  # only newly burned pixels
         optimizer.zero_grad()
         logits = model(X)
-        loss = loss_fn(logits, Y)
+        loss = loss_fn(logits, Y_spread)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * X.size(0)
     return total_loss / len(loader.dataset)
@@ -341,19 +427,27 @@ def train_epoch(model, loader, optimizer, loss_fn, device):
 def val_epoch(model, loader, loss_fn, device):
     model.eval()
     total_loss = 0.0
-    total_iou = 0.0
-    total_f1 = 0.0
+    iou_vals, f1_vals, spread_iou_vals = [], [], []
     n = 0
     with torch.no_grad():
         for X, Y in loader:
             X, Y = X.to(device), Y.to(device)
+            existing_fire = (X[:, 0:1] > 1.0).float()
+            Y_spread = Y * (1 - existing_fire)
             logits = model(X)
-            loss = loss_fn(logits, Y)
+            loss = loss_fn(logits, Y_spread)
             total_loss += loss.item() * X.size(0)
-            total_iou += iou_score(logits, Y) * X.size(0)
-            total_f1 += f1_score(logits, Y) * X.size(0)
             n += X.size(0)
-    return total_loss / n, total_iou / n, total_f1 / n
+
+            m = batch_metrics(logits, Y, existing_fire=existing_fire)
+            iou_vals.extend(v for v in m["iou"] if not math.isnan(v))
+            f1_vals.extend(v for v in m["f1"] if not math.isnan(v))
+            spread_iou_vals.extend(v for v in m["spread_iou"] if not math.isnan(v))
+
+    mean_iou        = float(np.mean(iou_vals))        if iou_vals        else 0.0
+    mean_f1         = float(np.mean(f1_vals))         if f1_vals         else 0.0
+    mean_spread_iou = float(np.mean(spread_iou_vals)) if spread_iou_vals else 0.0
+    return total_loss / n, mean_iou, mean_f1, mean_spread_iou
 
 
 def main():
@@ -385,9 +479,9 @@ def main():
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,
-                              num_workers=4, pin_memory=True)
+                              num_workers=2, pin_memory=False, persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=4, pin_memory=True)
+                            num_workers=2, pin_memory=False, persistent_workers=True)
 
     # Model
     model = UNet(n_channels=N_INPUT_CHANNELS, n_classes=1,
@@ -396,15 +490,25 @@ def main():
     print(f"Model parameters: {n_params:,}")
 
     # Loss function
-    pos_weight = compute_pos_weight(train_paths).to(device)
-    print(f"BCE pos_weight: {pos_weight.item():.1f}")
-
-    if LOSS_FUNCTION == "combo":
+    # Training objective: predict Y_spread (newly burned pixels only).
+    # This prevents the trivial fire-persistence solution (copy channel 0 → ~0.97 IoU).
+    print("Training objective: Y_spread = fire at T+12h NOT already burning at T")
+    if LOSS_FUNCTION == "focal_tversky":
+        loss_fn = FocalTverskyLoss(alpha=0.75, beta=0.25, gamma=1.33)
+        print("Loss: FocalTverskyLoss (alpha=0.75, beta=0.25, gamma=1.33)")
+    elif LOSS_FUNCTION == "combo":
+        print("Computing pos_weight for Y_spread (may take a minute)...")
+        pos_weight = compute_spread_pos_weight(train_paths).to(device)
+        print(f"Loss: ComboLoss  BCE spread pos_weight={pos_weight.item():.1f}")
         loss_fn = ComboLoss(pos_weight=pos_weight)
     elif LOSS_FUNCTION == "dice":
         loss_fn = DiceLoss()
+        print("Loss: DiceLoss")
     else:
+        print("Computing pos_weight for Y_spread (may take a minute)...")
+        pos_weight = compute_spread_pos_weight(train_paths).to(device)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        print(f"Loss: BCEWithLogitsLoss  spread pos_weight={pos_weight.item():.1f}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
@@ -418,46 +522,50 @@ def main():
         )
 
     # Training loop
-    best_val_iou = -1.0
+    # Early stopping and checkpointing on spread_iou (higher = better).
+    # val_loss is noisy with extreme pos_weight; spread_iou is the actual research metric.
+    best_spread_iou = -1.0
     epochs_no_improve = 0
     log_path = os.path.join(MODEL_DIR, "training_log.csv")
 
     with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_loss", "val_iou", "val_f1", "lr"])
+        writer.writerow(["epoch", "train_loss", "val_loss", "val_iou", "val_f1", "spread_iou", "lr"])
 
     for epoch in range(1, NUM_EPOCHS + 1):
         t0 = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
-        val_loss, val_iou, val_f1 = val_epoch(model, val_loader, loss_fn, device)
+        val_loss, val_iou, val_f1, spread_iou = val_epoch(model, val_loader, loss_fn, device)
 
         current_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
 
         print(f"Epoch {epoch:03d}/{NUM_EPOCHS} | "
               f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-              f"val_iou={val_iou:.4f} | val_f1={val_f1:.4f} | "
+              f"val_iou={val_iou:.4f} | spread_iou={spread_iou:.4f} | val_f1={val_f1:.4f} | "
               f"lr={current_lr:.2e} | {elapsed:.1f}s")
 
         with open(log_path, "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([epoch, train_loss, val_loss, val_iou, val_f1, current_lr])
+            writer.writerow([epoch, train_loss, val_loss, val_iou, val_f1, spread_iou, current_lr])
 
         # Scheduler step
         if LR_SCHEDULER == "cosine":
             scheduler.step()
         else:
-            scheduler.step(val_iou)
+            scheduler.step(val_loss)
 
-        # Checkpoint best model
-        if val_iou > best_val_iou:
-            best_val_iou = val_iou
+        # Checkpoint best model by spread_iou
+        if spread_iou > best_spread_iou:
+            best_spread_iou = spread_iou
             epochs_no_improve = 0
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_loss,
                 "val_iou": val_iou,
+                "spread_iou": spread_iou,
                 "val_f1": val_f1,
                 "config": {
                     "n_channels": N_INPUT_CHANNELS,
@@ -469,10 +577,10 @@ def main():
             epochs_no_improve += 1
 
         if epochs_no_improve >= PATIENCE:
-            print(f"Early stopping triggered after {epoch} epochs (best val_iou={best_val_iou:.4f})")
+            print(f"Early stopping triggered after {epoch} epochs (best spread_iou={best_spread_iou:.4f})")
             break
 
-    print(f"\nTraining complete. Best val IoU: {best_val_iou:.4f}")
+    print(f"\nTraining complete. Best spread_iou: {best_spread_iou:.4f}")
     print(f"Model saved to {os.path.join(MODEL_DIR, 'best_model.pt')}")
 
 

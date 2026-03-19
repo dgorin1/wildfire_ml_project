@@ -242,7 +242,7 @@ def compute_norm_stats(train_npz_paths):
     Compute per-channel mean and std by streaming through saved npz files.
     Uses a single-pass online algorithm — never loads more than one file at a time.
     """
-    n_channels = 17
+    n_channels = len(CHANNEL_NAMES)
     ch_sum    = np.zeros(n_channels, dtype=np.float64)
     ch_sum_sq = np.zeros(n_channels, dtype=np.float64)
     ch_count  = np.zeros(n_channels, dtype=np.int64)
